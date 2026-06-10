@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: wc2026-edge
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ODDS_API_KEY
+        sync: false
+      - key: AF_KEY
+        sync: false
+      - key: PORT
+        value: 10000
