@@ -1833,7 +1833,17 @@ function getLiveOdds(homeZh, awayZh){
 
 // ══ STATE ══
 let records=JSON.parse(localStorage.getItem('wc26_rec')||'[]');
-let matchResults=JSON.parse(localStorage.getItem('wc26_results')||'{}'); // {matchId:{hG,aG,note,ts}}
+// ── 已完賽結果（截至 2026-06-13 台灣時間）────────────────────
+// 以 localStorage 資料優先；DEFAULT 僅作初始底層，不蓋掉使用者手動結算
+const DEFAULT_RESULTS={
+  'A1':{hG:2,aG:0,note:"Quiñones 9' · Jiménez(2H) ⬛三張紅牌（蒙特斯/南非2名）",ts:1749600000000},
+  'A2':{hG:2,aG:1,note:"Krejčí 59'(捷克) · Hwang 67' · Oh 80'(韓國逆轉)",ts:1749621600000},
+  'B1':{hG:1,aG:1,note:"Lukić 21'(波士尼亞先進) · Larin 78'(加拿大扳平，首屆得點)",ts:1749686400000},
+  'D1':{hG:4,aG:1,note:"OG Bobadilla 7' · Balogun 31' · +2(USA) · Mauricio 73'(PAR)",ts:1749711600000},
+};
+const _storedResults=JSON.parse(localStorage.getItem('wc26_results')||'{}');
+// localStorage 的紀錄優先覆蓋 DEFAULT（保留使用者手動結算）
+let matchResults={...DEFAULT_RESULTS,..._storedResults}; // {matchId:{hG,aG,note,ts}}
 let settings=JSON.parse(localStorage.getItem('wc26_cfg')||'{"dailyLimit":15,"streakLimit":3,"initialBankroll":10000}');
 let currentTeam='法國';
 let currentEmotion=null;
