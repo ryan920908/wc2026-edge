@@ -207,7 +207,7 @@ select option{background:var(--bg2)}
     <div style="font-size:1rem;font-weight:600">2026 世界盃 — 完整分組</div>
     <div class="fb mb8">
     <div class="xs dim">來源：FIFA官方 2025/12/05 抽籤</div>
-    <button class="btn btn-ghost btn-sm" onclick="loadLiveStandings()" id="standings-btn">📊 載入即時積分榜</button>
+    <button class="btn btn-ghost btn-sm" onclick="loadLiveStandings()" id="standings-btn">📊 即時積分榜</button>
   </div>
   <div id="live-standings" style="display:none" class="mb12"></div>
   <div class="xs dim">來源：FIFA官方 2025/12/05 抽籤 ｜ 點擊隊伍查看詳細分析</div>
@@ -1444,7 +1444,10 @@ const AF_SEASON = 2026;
 let afCache = {};       // {endpoint: {data, ts}}
 const AF_CACHE_TTL = 15*60*1000; // 15分鐘快取
 
+let AF_PLAN_ERROR = false; // 免費方案不支援 2026，偵測後全面停用 AF API 呼叫
+
 async function afGet(endpoint, params={}, cacheTTL=AF_CACHE_TTL){
+  if(AF_PLAN_ERROR) return null; // 已知方案限制，直接跳過不再呼叫
   const url = new URL(`${AF_BASE}/${endpoint}`, location.origin);
   Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));
   const key = url.toString();
@@ -1454,11 +1457,17 @@ async function afGet(endpoint, params={}, cacheTTL=AF_CACHE_TTL){
     const resp = await fetch(url.toString());
     const data = await resp.json();
     if(data.errors && Object.keys(data.errors).length){
-      console.warn('AF API error:', data.errors);
+      const errMsg = Object.values(data.errors).join('');
+      if(errMsg.includes('Free plans do not have access')){
+        AF_PLAN_ERROR = true;
+        document.querySelectorAll('.af-remain').forEach(el=>el.textContent='AF: 免費方案不支援2026');
+        console.warn('⚠️ API-Football 免費方案不支援 2026 賽季，相關功能（陣容/即時比分/傷兵）已停用');
+      } else {
+        console.warn('AF API error:', data.errors);
+      }
       return null;
     }
     afCache[key]={data, ts:now};
-    // 顯示剩餘請求數
     const rem = resp.headers.get('x-ratelimit-requests-remaining');
     const lim = resp.headers.get('x-ratelimit-requests-limit');
     if(rem) document.querySelectorAll('.af-remain').forEach(el=>el.textContent=`AF ${rem}/${lim}次`);
@@ -1663,22 +1672,23 @@ async function fetchTeamStats(teamName){
 
 // ══ 啟動時初始化 AF API ══
 async function initAFAPI(){
-  console.log('🔄 初始化 API-Football...');
+  // 先發一次探測請求確認方案是否支援 2026
+  const probe = await afGet('fixtures', {league:AF_LEAGUE, season:AF_SEASON, last:1});
+  if(AF_PLAN_ERROR){
+    console.warn('⚠️ API-Football 免費方案限制，略過陣容/傷兵/積分榜 API 呼叫');
+    document.querySelectorAll('.af-remain').forEach(el=>el.textContent='AF: 免費版不支援2026');
+    return;
+  }
   await buildFixtureMap();
   await fetchInjuries();
-  // 更新傷兵到 TEAMS_DETAIL
   Object.entries(injuries).forEach(([team, injList])=>{
     if(TEAMS_DETAIL[team] && injList.length){
       const injStr = injList.map(i=>`${i.player}（${i.type}）`).join('、');
       TEAMS_DETAIL[team].inj = injStr;
     }
   });
-  // 開賽後才抓積分榜
-  if(new Date() >= new Date('2026-06-11')){
-    await fetchStandings();
-  }
+  if(new Date() >= new Date('2026-06-11')) await fetchStandings();
   console.log('✅ API-Football 初始化完成');
-  // 重新計算模型（傷兵資料更新後）
   refreshAllModelProbs();
 }
 let liveOdds = {}; // 快取即時賠率
@@ -2479,11 +2489,7 @@ function showPlayerDetail(p){
 
 // ══ 比賽分析 ══
 function initAnalysis(){
-  // 開啟分析頁時也刷新賠率
-  // 初始化 API-Football（先發名單、傷兵、積分榜）
-initAFAPI().catch(e=>console.warn('AF API 初始化失敗:', e.message));
-
-fetchLiveOdds().then(()=>{
+  fetchLiveOdds().then(()=>{
     const id=document.getElementById('ana-sel').value;
     if(id) loadAnalysis();
   });
@@ -3361,56 +3367,94 @@ function buildInjuryCard(homeTeam, awayTeam){
   return out;
 }
 
-// ══ 即時積分榜渲染 ══
-async function loadLiveStandings(){
+// ══ 本地積分榜計算（從 matchResults + MATCHES 推算，不依賴 API）══
+function computeLocalStandings(){
+  const groups = {};
+  // 初始化每支隊伍統計
+  MATCHES.forEach(m=>{
+    [m.home, m.away].forEach(team=>{
+      if(!groups[m.g]) groups[m.g]={};
+      if(!groups[m.g][team]) groups[m.g][team]={team, played:0, w:0, d:0, l:0, gf:0, ga:0, pts:0};
+    });
+  });
+  // 填入已完賽結果
+  MATCHES.forEach(m=>{
+    const r = matchResults[m.id];
+    if(!r || r.hG == null || r.aG == null) return;
+    const hG=Number(r.hG), aG=Number(r.aG);
+    const h=groups[m.g][m.home], a=groups[m.g][m.away];
+    h.played++; a.played++;
+    h.gf+=hG; h.ga+=aG;
+    a.gf+=aG; a.ga+=hG;
+    if(hG>aG){ h.w++;h.pts+=3; a.l++; }
+    else if(hG<aG){ a.w++;a.pts+=3; h.l++; }
+    else { h.d++;h.pts+=1; a.d++;a.pts+=1; }
+  });
+  // 每組排序：積分→球差→進球
+  return Object.entries(groups).map(([gName, teams])=>{
+    const arr = Object.values(teams).sort((a,b)=>{
+      if(b.pts!==a.pts) return b.pts-a.pts;
+      const gdB=b.gf-b.ga, gdA=a.gf-a.ga;
+      if(gdB!==gdA) return gdB-gdA;
+      return b.gf-a.gf;
+    });
+    return {gName, teams:arr};
+  }).sort((a,b)=>a.gName.localeCompare(b.gName));
+}
+
+// ══ 即時積分榜渲染（本地計算，不需 API）══
+function loadLiveStandings(){
   const btn=document.getElementById('standings-btn');
   const el=document.getElementById('live-standings');
   if(!el) return;
-  if(btn) btn.textContent='⏳ 載入中...';
   el.style.display='block';
-  const data = await fetchStandings();
-  if(!data||!data.length){
-    el.innerHTML='<div class="xs dim">積分榜待6/11開賽後更新（API-Football）</div>';
-    if(btn) btn.textContent='📊 積分榜（待開賽）';
+  const data = computeLocalStandings();
+  if(!data.length){
+    el.innerHTML='<div class="xs dim">暫無賽果資料</div>';
     return;
   }
-  if(btn) btn.textContent='✅ 即時積分榜';
-  // 按組別渲染
-  el.innerHTML=data.map(group=>{
-    const groupName = group[0]?.group||'';
-    return `<div class="card mb8">
-      <div class="card-hd"><span class="card-title">${groupName}</span></div>
+  if(btn) btn.textContent='✅ 積分榜';
+  const playedCount = Object.values(matchResults).length;
+  el.innerHTML=`<div class="xs dim mb8" style="color:var(--gold)">📊 已更新 ${playedCount} 場賽果（本地計算）</div>`+
+  data.map(({gName, teams})=>`
+    <div class="card mb8">
+      <div class="card-hd"><span class="card-title">${gName}</span></div>
       <div class="card-body" style="padding:0">
         <table class="tbl" style="font-size:0.7rem">
           <thead><tr><th>#</th><th>隊伍</th><th>賽</th><th>勝</th><th>平</th><th>負</th><th>得</th><th>失</th><th>差</th><th>積分</th></tr></thead>
           <tbody>
-            ${group.map(t=>`<tr style="${t.rank<=2?'color:var(--green)':t.rank===3?'color:var(--amber)':''}">
-              <td class="mono">${t.rank}</td>
-              <td>${t.team.name}</td>
-              <td class="mono">${t.all.played}</td>
-              <td class="mono">${t.all.win}</td>
-              <td class="mono">${t.all.draw}</td>
-              <td class="mono">${t.all.lose}</td>
-              <td class="mono">${t.all.goals.for}</td>
-              <td class="mono">${t.all.goals.against}</td>
-              <td class="mono ${t.goalsDiff>=0?'green':'red'}">${t.goalsDiff>0?'+':''}${t.goalsDiff}</td>
-              <td class="mono bold">${t.points}</td>
-            </tr>`).join('')}
+            ${teams.map((t,i)=>{
+              const gd=t.gf-t.ga;
+              const rowColor=i===0||i===1?'color:var(--green)':i===2?'color:var(--amber)':'';
+              return `<tr style="${rowColor}">
+                <td class="mono bold">${i+1}</td>
+                <td>${t.team}</td>
+                <td class="mono">${t.played}</td>
+                <td class="mono">${t.w}</td>
+                <td class="mono">${t.d}</td>
+                <td class="mono">${t.l}</td>
+                <td class="mono">${t.gf}</td>
+                <td class="mono">${t.ga}</td>
+                <td class="mono ${gd>=0?'green':'red'}">${gd>0?'+':''}${gd}</td>
+                <td class="mono bold">${t.pts}</td>
+              </tr>`;
+            }).join('')}
           </tbody>
         </table>
       </div>
-    </div>`;
-  }).join('');
+    </div>`).join('');
 }
 
-// ══ 即時比分 polling（開賽後每分鐘更新）══
+// ══ 即時比分 polling（需 API-Football 付費方案支援 2026）══
 let liveScoreInterval = null;
 function startLiveScorePolling(){
+  // API-Football 免費方案不支援 2026，polling 不啟動
+  if(AF_PLAN_ERROR) return;
   if(liveScoreInterval) return;
   liveScoreInterval = setInterval(async()=>{
+    if(AF_PLAN_ERROR){ stopLiveScorePolling(); return; }
     const scores = await fetchLiveScores();
     if(!Object.keys(scores).length) return;
-    // 更新賽程頁面的比分顯示
     Object.entries(scores).forEach(([matchId, score])=>{
       const el=document.getElementById('score-'+matchId);
       if(el){
@@ -3418,25 +3462,26 @@ function startLiveScorePolling(){
         el.innerHTML=`<span style="color:${statusColor};font-size:0.8rem">${score.home_goals??'-'} - ${score.away_goals??'-'}</span> <span class="xs dim">${score.statusLong||''} ${score.minute?score.minute+"'":''}</span>`;
       }
     });
-    // 有進行中比賽才顯示提示
     const live=Object.values(scores).filter(s=>s.status==='1H'||s.status==='2H'||s.status==='ET');
     if(live.length) toast(`🔴 ${live.length} 場比賽進行中`);
-  }, 60*1000); // 每分鐘
+  }, 60*1000);
 }
 function stopLiveScorePolling(){
   if(liveScoreInterval){clearInterval(liveScoreInterval);liveScoreInterval=null;}
 }
 
 // ══ INIT ══
-// 啟動時先動態計算所有場次模型勝率
 refreshAllModelProbs();
 renderGroups();
-// 啟動時自動抓即時賠率，完成後才渲染賽程
-fetchLiveOdds().then(()=>{
+// 並行：即時賠率 + AF API 探測，兩者都完成後決定是否啟動 polling
+Promise.all([
+  fetchLiveOdds(),
+  initAFAPI().catch(e=>console.warn('AF 初始化失敗:', e.message)),
+]).then(()=>{
   renderMatches(MATCHES);
-  console.log('WC26 EDGE 啟動完成，即時賠率已載入');
-  // 開賽後啟動即時比分
-  if(new Date() >= new Date('2026-06-11')) startLiveScorePolling();
+  console.log(`WC26 EDGE 啟動完成 | Odds API ✅ | AF API ${AF_PLAN_ERROR?'❌ 免費方案限制':'✅'}`);
+  // polling 只有 AF 方案支援時才啟動
+  if(new Date() >= new Date('2026-06-11') && !AF_PLAN_ERROR) startLiveScorePolling();
 });
 
 // ── PWA Service Worker ────────────────────────────────────────
